@@ -8,6 +8,8 @@ export type SessionState = "idle" | "running" | "error";
 export type SessionSummary = {
   id: string;
   title: string;
+  /** The title is the first prompt's fallback while a generated title is expected. */
+  title_pending: boolean;
   model: string;
   state: SessionState;
   /** Finished or errored while not active. */
@@ -161,6 +163,7 @@ export type SubagentRoster = { max_subagents: number; agents: Subagent[] };
 export type SessionSnapshot = {
   session: string;
   title: string;
+  title_pending: boolean;
   model: string;
   effort: Effort;
   reasoning_mode: ReasoningMode;
@@ -179,6 +182,7 @@ export type ToolDetail = { arguments: unknown; result: unknown | null; metadata:
 export type StreamEvents = {
   hello: { protocol_version: number; client_hint: string };
   live: { active: string | null; sessions: SessionSummary[] };
+  history_changed: Record<string, never>;
   active: { session: string };
   snapshot: SessionSnapshot;
   entry: { session: string; entry: WireEntry };
@@ -202,7 +206,7 @@ export type StreamEvent = {
 
 export const STREAM_EVENTS = [
   "hello", "live", "active", "snapshot", "entry", "status", "queue", "draft", "settings", "context",
-  "subagents", "subagent_entry", "closed", "workspace",
+  "subagents", "subagent_entry", "closed", "workspace", "history_changed",
 ] as const satisfies readonly StreamEventName[];
 
 export type OpenSpec =
@@ -230,6 +234,7 @@ export type Commands = {
   activate: { session: string };
   open_session: OpenSpec;
   close_session: { session: string; force?: boolean };
+  rename_session: { session: string; title: string };
   attach_image: { session: string; data_url: string };
   reflect: { session: string; instructions?: string };
   handoff: { session: string };
@@ -265,6 +270,8 @@ export type PersistedSession = {
   reasoning_mode: ReasoningMode;
   workspace: string;
   preview: string;
+  /** The preview is a fallback while a claimed title is being generated. */
+  title_pending?: true;
   /** Conversation text around the search match, when the session was found by its conversation. */
   snippet?: string;
 };

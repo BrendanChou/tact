@@ -27,6 +27,7 @@ export type TranscriptData = {
 export type SessionView = TranscriptData & {
   id: string;
   title: string;
+  titlePending: boolean;
   model: string;
   effort: Effort;
   reasoningMode: ReasoningMode;
@@ -57,7 +58,7 @@ export type AppState = {
  */
 export type Change =
   | {
-    type: "connection" | "live" | "session" | "status" | "queue" | "draft" | "settings" | "context"
+    type: "connection" | "live" | "history" | "session" | "status" | "queue" | "draft" | "settings" | "context"
       | "subagents";
   }
   /** Files changed in `checkout`, or in the session's workspace when it is null. */
@@ -94,6 +95,7 @@ function sessionView(snapshot: SessionSnapshot): SessionView {
     ...transcriptData(snapshot.entries),
     id: snapshot.session,
     title: snapshot.title,
+    titlePending: snapshot.title_pending,
     model: snapshot.model,
     effort: snapshot.effort,
     reasoningMode: snapshot.reasoning_mode,
@@ -119,12 +121,16 @@ export function reduce(state: AppState, event: StreamEvent): Change[] {
       state.protocolVersion = event.data.protocol_version;
       state.connection = "open";
       return [{ type: "connection" }];
+    case "history_changed":
+      return [{ type: "history" }];
     case "live": {
       state.live = event.data.sessions;
       state.active = event.data.active;
-      const title = state.session && event.data.sessions.find((summary) => summary.id === state.session!.id)?.title;
-      if (title && state.session && title !== state.session.title) {
-        state.session.title = title;
+      const session = state.session;
+      const summary = session && event.data.sessions.find((candidate) => candidate.id === session.id);
+      if (session && summary?.title && (summary.title !== session.title || summary.title_pending !== session.titlePending)) {
+        session.title = summary.title;
+        session.titlePending = summary.title_pending;
         return [{ type: "live" }, { type: "settings" }];
       }
       return [{ type: "live" }];

@@ -32,6 +32,7 @@ use crate::{
             QueuedPrompt, SessionInfo,
         },
         session::{ConversationMatches, RecentPrompt, SessionSummary},
+        titles::Title,
         transcript::TranscriptRecord,
     },
 };
@@ -268,6 +269,7 @@ impl Settings {
 /// The last published state of a live session.
 struct Published {
     session: String,
+    title: Option<Title>,
     draft: Draft,
     queue: Vec<QueuedPrompt>,
     settings: Settings,
@@ -305,6 +307,11 @@ pub(crate) struct AppNode {
     max_live_sessions: usize,
     overlay: Option<AppOverlay>,
     publisher: Option<Publisher>,
+    /// Last persisted titles, including sessions whose panes have not opened yet.
+    titles: HashMap<String, Title>,
+    /// Whether a title model is configured, so a session named by its first prompt can expect a
+    /// generated title before one is claimed.
+    generating_titles: bool,
     /// The last published active session.
     active: Option<String>,
 }
@@ -334,6 +341,8 @@ impl AppNode {
             max_live_sessions: 8,
             overlay: None,
             publisher: None,
+            titles: HashMap::new(),
+            generating_titles: false,
             active: None,
         };
         app.refresh_layout();
@@ -559,25 +568,35 @@ impl AppNode {
             } => self.update_root(pane, RootEvent::MemoryDeleteFailed { error, conflict }),
             AppEvent::SessionRestored {
                 pane,
-                projection,
+                mut projection,
                 effort,
                 reasoning_mode,
                 preferred_reasoning_mode,
                 speed,
                 model,
                 skills,
-            } => self.update_root(
-                pane,
-                RootEvent::SessionRestored {
-                    projection,
-                    effort,
-                    reasoning_mode,
-                    preferred_reasoning_mode,
-                    speed,
-                    model,
-                    skills,
-                },
-            ),
+            } => {
+                if let Some(title) = self
+                    .panes
+                    .get(&pane)
+                    .and_then(|entry| entry.published.as_ref())
+                    .and_then(|published| self.titles.get(&published.session))
+                {
+                    projection.title = Some(title.text.clone());
+                }
+                self.update_root(
+                    pane,
+                    RootEvent::SessionRestored {
+                        projection,
+                        effort,
+                        reasoning_mode,
+                        preferred_reasoning_mode,
+                        speed,
+                        model,
+                        skills,
+                    },
+                )
+            }
             AppEvent::EffortUpdateFailed {
                 pane,
                 effort,
@@ -883,12 +902,16 @@ impl AppNode {
             .map(|(&pane, entry)| {
                 let root = &entry.root;
                 let busy = root.busy();
+                let session_id = entry
+                    .published
+                    .as_ref()
+                    .map(|published| published.session.clone());
                 LiveSession {
                     pane,
-                    session_id: entry
-                        .published
-                        .as_ref()
-                        .map(|published| published.session.clone()),
+                    title_pending: session_id.as_deref().is_some_and(|session| {
+                        title_pending(&self.titles, self.generating_titles, session, root)
+                    }),
+                    session_id,
                     title: root.title().unwrap_or(UNTITLED_SESSION).to_owned(),
                     model: model::name(root.composer().model()).to_owned(),
                     running: busy.turns > 0 || busy.shells > 0,
@@ -1250,6 +1273,42 @@ impl AppNode {
         self.panes.get_mut(&pane).map(|entry| &mut entry.root)
     }
 
+    pub(crate) fn set_session_title(&mut self, session: &str, title: Title) -> bool {
+        let stored = self.titles.get(session) != Some(&title);
+        if stored {
+            self.titles.insert(session.to_owned(), title.clone());
+            if let Some(publisher) = &self.publisher {
+                publisher.publish(Publication::HistoryChanged);
+            }
+        }
+        let mut changed = stored;
+        for entry in self.panes.values_mut() {
+            changed |= entry.root.update_saved_session_title(session, &title.text);
+            if entry
+                .published
+                .as_ref()
+                .is_some_and(|published| published.session == session)
+                && entry.root.title() != Some(title.text.as_str())
+            {
+                entry.root.set_title(title.text.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_sessions_overlay();
+        }
+        changed
+    }
+
+    pub(crate) fn set_title_generation(&mut self, generating: bool) -> bool {
+        if self.generating_titles == generating {
+            return false;
+        }
+        self.generating_titles = generating;
+        self.refresh_sessions_overlay();
+        true
+    }
+
     /// Records that `pane` now hosts `session` and announces it. A pane whose session was
     /// replaced in place announces the previous session as closed first; its draft revision keeps
     /// increasing.
@@ -1263,10 +1322,14 @@ impl AppNode {
             return;
         };
         let previous = entry.published.take();
+        if let Some(title) = self.titles.get(&session) {
+            entry.root.set_title(title.text.clone());
+        }
         let root = &entry.root;
         let settings = Settings::of(root);
         let published = Published {
             session,
+            title: None,
             draft: Draft {
                 rev: previous.as_ref().map_or(0, |previous| previous.draft.rev),
                 text: root.shared_draft().to_owned(),
@@ -1310,6 +1373,8 @@ impl AppNode {
             publisher,
             focus,
             active,
+            titles,
+            generating_titles,
             ..
         } = self;
         let publisher = publisher.as_ref();
@@ -1327,6 +1392,25 @@ impl AppNode {
             let Some(published) = &mut entry.published else {
                 continue;
             };
+            let pending = title_pending(titles, *generating_titles, &published.session, root);
+            let current = root.title().map(|text| (text, pending));
+            if published
+                .title
+                .as_ref()
+                .map(|title| (title.text.as_str(), title.pending))
+                != current
+            {
+                published.title = current.map(|(text, pending)| Title {
+                    text: text.to_owned(),
+                    pending,
+                });
+                if let Some(title) = &published.title {
+                    publish(Publication::Title {
+                        session: published.session.clone(),
+                        title: title.clone(),
+                    });
+                }
+            }
             let draft = root.shared_draft();
             let images_changed = !images_match(&published.draft.images, root);
             if published.draft.text != draft || images_changed {
@@ -1479,7 +1563,8 @@ impl AppNode {
                 instructions,
             } => (session, PaneCommand::Reflect(instructions)),
             Command::Handoff { session } => (session, PaneCommand::Handoff),
-            Command::ReloadConfig
+            Command::RenameSession { .. }
+            | Command::ReloadConfig
             | Command::WriteConfig { .. }
             | Command::DeleteMemory { .. }
             | Command::SetMaxSubagents { .. } => {
@@ -1508,6 +1593,21 @@ fn queued_prompts(root: &RootNode) -> Vec<QueuedPrompt> {
             steering: entry.steering,
         })
         .collect()
+}
+
+/// A stored title is pending while its generation claim is. Before the background generator
+/// claims a session, a session named by its own first prompt expects a title whenever a title
+/// model is configured; inherited fork titles and empty sessions do not.
+fn title_pending(
+    titles: &HashMap<String, Title>,
+    generating: bool,
+    session: &str,
+    root: &RootNode,
+) -> bool {
+    titles.get(session).map_or_else(
+        || generating && !root.recent_prompts().is_empty(),
+        |title| title.pending,
+    )
 }
 
 fn draft_images(root: &RootNode) -> Vec<DraftImage> {
@@ -1562,6 +1662,7 @@ mod tests {
         },
         core::{
             pane::PaneId,
+            titles::Title,
             transcript::{LocalEvent, TranscriptRecord, TurnId, UserSubmitted},
         },
     };
@@ -1585,6 +1686,80 @@ mod tests {
             KeyCode::Char(character),
             KeyModifiers::CONTROL,
         )))
+    }
+
+    #[test]
+    fn titles_received_before_a_session_opens_are_installed_on_registration() {
+        let mut app = app();
+        app.set_session_title(
+            "saved",
+            Title {
+                text: "Current title".to_owned(),
+                pending: false,
+            },
+        );
+        app.session_opened(PaneId::Main, "saved".to_owned(), Vec::new());
+        assert_eq!(
+            app.root(PaneId::Main).unwrap().title(),
+            Some("Current title")
+        );
+        let projection = RootNode::project_session(ReasoningEffort::Medium, Vec::new());
+        app.update(AppEvent::SessionRestored {
+            pane: PaneId::Main,
+            projection: Box::new(projection),
+            effort: ReasoningEffort::Medium,
+            reasoning_mode: ReasoningMode::Standard,
+            preferred_reasoning_mode: ReasoningMode::Standard,
+            speed: Speed::Standard,
+            model: Model::Codex(CodexModel::Luna),
+            skills: Arc::from([]),
+        });
+        assert_eq!(
+            app.root(PaneId::Main).unwrap().title(),
+            Some("Current title")
+        );
+    }
+
+    #[test]
+    fn saved_title_updates_reach_an_open_picker_without_a_live_session() {
+        let mut app = app();
+        app.update(AppEvent::SessionsLoaded {
+            pane: PaneId::Main,
+            sessions: vec![crate::core::session::SessionSummary {
+                session_id: "saved".to_owned(),
+                started_at_unix_ms: 1,
+                model: "model".to_owned(),
+                effort: ReasoningEffort::Medium,
+                reasoning_mode: ReasoningMode::Standard,
+                workspace: PathBuf::from("/workspace"),
+                preview: "old title".to_owned(),
+                title_pending: false,
+                snippet: None,
+            }],
+        });
+        assert!(app.set_session_title(
+            "saved",
+            Title {
+                text: "updated title".to_owned(),
+                pending: false
+            }
+        ));
+        assert!(!app.set_session_title(
+            "saved",
+            Title {
+                text: "updated title".to_owned(),
+                pending: false
+            }
+        ));
+        app.update(AppEvent::Terminal(Event::Paste("updated".to_owned())));
+        let update = app.update(AppEvent::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))));
+        assert!(matches!(update.effects.as_slice(), [AppEffect::Pane {
+            pane: PaneId::Main,
+            effect: RootEffect::ResumeSession(session),
+        }] if session == "saved"));
     }
 
     #[test]
@@ -2299,6 +2474,8 @@ mod registry_tests {
             pane::PaneId,
             prompt::Submission,
             protocol::{Command, CommandError, Draft, OpenSpec, Origin, Publication, Reply},
+            titles::Title,
+            transcript::{LocalEvent, TranscriptRecord, TurnId, UserSubmitted},
         },
         web::bridge::{self, WebEnd},
     };
@@ -2404,6 +2581,90 @@ mod registry_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn published_titles(publications: &[Publication]) -> Vec<(String, bool)> {
+        publications
+            .iter()
+            .filter_map(|publication| match publication {
+                Publication::Title { title, .. } => Some((title.text.clone(), title.pending)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    impl Harness {
+        fn submit_first_prompt(&mut self, text: &str) -> Vec<Publication> {
+            let record = TranscriptRecord::from_local(
+                1,
+                1,
+                LocalEvent::UserSubmitted(UserSubmitted {
+                    id: TurnId::new(1),
+                    text: text.to_owned(),
+                }),
+            )
+            .unwrap();
+            self.app.update(AppEvent::Transcript {
+                pane: PaneId::Main,
+                record: Arc::new(record),
+            });
+            self.app.publish_changes(Origin::Terminal);
+            self.publications()
+        }
+
+        fn store_title(&mut self, text: &str, pending: bool) -> Vec<Publication> {
+            let title = Title {
+                text: text.to_owned(),
+                pending,
+            };
+            self.app.set_session_title("main", title);
+            self.app.publish_changes(Origin::Terminal);
+            self.publications()
+        }
+
+        fn live_title_pending(&self) -> bool {
+            self.app.live_sessions()[0].title_pending
+        }
+    }
+
+    #[test]
+    fn live_titles_pend_from_the_first_prompt_until_generation_ends() {
+        let mut harness = Harness::new();
+        assert!(harness.app.set_title_generation(true));
+        harness.app.publish_changes(Origin::Terminal);
+        assert!(published_titles(&harness.publications()).is_empty());
+        assert!(!harness.live_title_pending());
+
+        let publications = harness.submit_first_prompt("Fix the parser\nwith context");
+        assert_eq!(
+            published_titles(&publications),
+            [("Fix the parser".to_owned(), true)]
+        );
+        assert!(harness.live_title_pending());
+        assert!(published_titles(&harness.store_title("Fix the parser", true)).is_empty());
+        assert_eq!(
+            published_titles(&harness.store_title("Parser repair", false)),
+            [("Parser repair".to_owned(), false)]
+        );
+        assert!(!harness.live_title_pending());
+    }
+
+    #[test]
+    fn settled_or_unavailable_generation_leaves_the_fallback_final() {
+        let mut harness = Harness::new();
+        assert_eq!(
+            published_titles(&harness.submit_first_prompt("Fix the parser")),
+            [("Fix the parser".to_owned(), false)]
+        );
+
+        let mut harness = Harness::new();
+        harness.app.set_title_generation(true);
+        harness.submit_first_prompt("Fix the parser");
+        assert_eq!(
+            published_titles(&harness.store_title("Fix the parser", false)),
+            [("Fix the parser".to_owned(), false)]
+        );
+        assert!(!harness.live_title_pending());
     }
 
     #[test]

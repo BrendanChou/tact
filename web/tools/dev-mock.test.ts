@@ -1,6 +1,24 @@
 import { expect, test } from "bun:test";
 import { MockRefusal, MockTact } from "./dev-mock";
-import type { SessionSnapshot, WireEntry } from "../src/core/wire";
+import type { SessionSnapshot, StreamEvents, WireEntry } from "../src/core/wire";
+
+test("renaming a mock session targets its ID and publishes its canonical title", () => {
+  const mock = new MockTact();
+  const session = mock.active!;
+  const updates: StreamEvents["live"][] = [];
+  mock.subscribe((name, data) => {
+    if (name === "live") updates.push(data as StreamEvents["live"]);
+  });
+  const { session: other } = mock.command("open_session", { new: {} }, 1) as { session: string };
+  mock.command("rename_session", { session, title: "  Chosen title  " }, 1);
+  expect(updates.at(-1)!.sessions.find((summary) => summary.id === session)?.title).toBe("Chosen title");
+  expect(updates.at(-1)!.sessions.find((summary) => summary.id === other)?.title).toBe("New chat");
+  expect(mock.active).toBe(other);
+  mock.command("activate", { session }, 1);
+  const snapshot = mock.greeting().find((event) => event.name === "snapshot")!.data as SessionSnapshot;
+  expect(snapshot.title).toBe("Chosen title");
+  expect(() => mock.command("rename_session", { session, title: "   " }, 1)).toThrow(MockRefusal);
+});
 
 test("the mock follows the shared-draft contract: tagged echoes and revision-checked submit", async () => {
   const mock = new MockTact();
@@ -49,4 +67,20 @@ test("the mock publishes agent threads to the session and to each participant's 
   expect(threads(mock.agentTranscript(session, 4).entries)).toEqual([1, 3]);
   const failed = snapshot.entries.find((entry) => entry.kind === "directed_message" && entry.thread === 3);
   expect(failed).toMatchObject({ delivery: "failed", messages: [{ from: 3, to: 4, delivery: "failed" }] });
+});
+
+test("a mock session's first prompt names it with a pending title until the generated one lands", async () => {
+  const mock = new MockTact();
+  mock.pace = 0;
+  const { session } = mock.command("open_session", { new: {} }, 1) as { session: string };
+  const titles: [string, boolean][] = [];
+  mock.subscribe((name, data) => {
+    const summary = name === "live" && (data as StreamEvents["live"]).sessions.find((candidate) => candidate.id === session);
+    if (summary) titles.push([summary.title, summary.title_pending]);
+  });
+  mock.command("set_draft", { session, text: "Harden the flaky bridge test. It fails on CI." }, 1);
+  mock.command("submit", { session, rev: 1 }, 1);
+  expect(titles.at(-1)).toEqual(["Harden the flaky bridge test. It fails on CI.", true]);
+  await Bun.sleep(5);
+  expect(titles.at(-1)).toEqual(["Harden the flaky bridge test", false]);
 });

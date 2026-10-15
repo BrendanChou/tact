@@ -4,9 +4,12 @@ mod conversation_search;
 
 use crate::{
     app::config::{ReasoningEffort, ReasoningMode, Speed},
-    core::transcript::{
-        EffortChanged, FastModeChanged, LocalKind, SCHEMA_VERSION, SessionStarted, SpeedChanged,
-        TerminalStopReason, TranscriptRecord, TurnId, WorkerTurnAccepted,
+    core::{
+        titles::{GENERATION_LIMIT, Title},
+        transcript::{
+            EffortChanged, FastModeChanged, LocalKind, SCHEMA_VERSION, SessionStarted,
+            SpeedChanged, TerminalStopReason, TranscriptRecord, TurnId, WorkerTurnAccepted,
+        },
     },
 };
 pub(crate) use conversation_search::{ConversationMatch, search_terms};
@@ -20,7 +23,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
@@ -98,6 +101,8 @@ pub(crate) struct StoredSession {
     pub(crate) reasoning_mode: ReasoningMode,
     pub(crate) workspace: PathBuf,
     pub(crate) preview: String,
+    /// The preview is a fallback title while a generated one is expected.
+    pub(crate) title_pending: bool,
 }
 
 pub(crate) struct SessionSearchPage {
@@ -172,6 +177,7 @@ impl SessionStorage {
         initialize(&connection, &path)?;
         ensure_discovery_indexes(&connection, &path)?;
         conversation_search::ensure_schema(&connection, &path)?;
+        ensure_titles(&connection, &path)?;
         set_private_file_permissions(&path)?;
         Ok(Self {
             path,
@@ -473,6 +479,161 @@ impl SessionStorage {
             .transpose()
     }
 
+    /// A generated title is pending while its claim is younger than [`GENERATION_LIMIT`]; an older
+    /// claim belongs to a process that exited mid-generation, so its fallback is final.
+    pub(crate) fn titles(&self) -> Result<HashMap<String, Title>, StorageError> {
+        let exists: bool = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) = 2 FROM sqlite_schema
+                 WHERE name IN ('session_titles', 'title_claims')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| query(&self.path, source))?;
+        if !exists {
+            return Ok(HashMap::new());
+        }
+        let fresh_after = unix_ms().saturating_sub(GENERATION_LIMIT.as_millis() as i64);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT t.session_id, t.title,
+                     t.source = 'generated' AND c.claimed_at_ms IS NOT NULL AND c.claimed_at_ms > ?1
+                 FROM session_titles t LEFT JOIN title_claims c ON c.session_id = t.session_id",
+            )
+            .map_err(|source| query(&self.path, source))?;
+        statement
+            .query_map([fresh_after], |row| {
+                Ok((
+                    row.get(0)?,
+                    Title {
+                        text: row.get(1)?,
+                        pending: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|source| query(&self.path, source))?
+            .map(|row| row.map_err(|source| query(&self.path, source)))
+            .collect()
+    }
+
+    pub(crate) fn rename_session(&self, session_id: &str, title: &str) -> Result<(), StorageError> {
+        self.connection
+            .execute(
+                "INSERT INTO session_titles(session_id, title, source) VALUES (?1, ?2, 'manual')
+             ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, source = 'manual'",
+                params![session_id, title],
+            )
+            .map_err(|source| query(&self.path, source))?;
+        Ok(())
+    }
+
+    /// Claiming persists the fallback before a model call, so a crash or another process cannot
+    /// cause a session to be titled repeatedly. Manual titles own the row permanently. A claim
+    /// made while `generating` keeps the title pending until it is completed or settled.
+    pub(crate) fn claim_title(
+        &self,
+        session_id: &str,
+        fallback: &str,
+        generating: bool,
+    ) -> Result<bool, StorageError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|source| query(&self.path, source))?;
+        let claimed = transaction
+            .execute(
+                "INSERT INTO session_titles(session_id, title, source) VALUES (?1, ?2, 'generated')
+             ON CONFLICT(session_id) DO NOTHING",
+                params![session_id, fallback],
+            )
+            .map_err(|source| query(&self.path, source))?
+            == 1;
+        if claimed && generating {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO title_claims(session_id, claimed_at_ms) VALUES (?1, ?2)",
+                    params![session_id, unix_ms()],
+                )
+                .map_err(|source| query(&self.path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| query(&self.path, source))?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn complete_title(&self, session_id: &str, title: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE session_titles SET title = ?2 WHERE session_id = ?1 AND source = 'generated'",
+            params![session_id, title],
+        ).map_err(|source| query(&self.path, source))?;
+        self.settle_title(session_id)
+    }
+
+    /// Ends a pending claim without a generated title, leaving the fallback as the final title.
+    pub(crate) fn settle_title(&self, session_id: &str) -> Result<(), StorageError> {
+        self.connection
+            .execute(
+                "DELETE FROM title_claims WHERE session_id = ?1",
+                [session_id],
+            )
+            .map_err(|source| query(&self.path, source))?;
+        Ok(())
+    }
+
+    /// A bounded batch, newest first, excludes forks and sessions without a user prompt.
+    pub(crate) fn untitled_prompts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.session_id, (SELECT e.prompt_text FROM events e
+                 WHERE e.session_id = s.session_id AND e.prompt_text IS NOT NULL
+                 ORDER BY e.event_id LIMIT 1)
+             FROM sessions s WHERE s.parent_session_id IS NULL
+                 AND EXISTS(SELECT 1 FROM events e WHERE e.session_id = s.session_id AND e.prompt_text IS NOT NULL)
+                 AND NOT EXISTS(SELECT 1 FROM session_titles t WHERE t.session_id = s.session_id)
+             ORDER BY s.updated_at_ms DESC LIMIT ?1",
+        ).map_err(|source| query(&self.path, source))?;
+        statement
+            .query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|source| query(&self.path, source))?
+            .map(|row| row.map_err(|source| query(&self.path, source)))
+            .collect()
+    }
+
+    pub(crate) fn inherit_titles(&self) -> Result<(), StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH RECURSIVE lineage(session_id, depth) AS (
+                 SELECT session_id, 0 FROM sessions WHERE parent_session_id IS NULL
+                 UNION ALL
+                 SELECT s.session_id, l.depth + 1 FROM sessions s
+                 JOIN lineage l ON s.parent_session_id = l.session_id
+             )
+             SELECT s.session_id, s.parent_session_id FROM sessions s
+             JOIN lineage l ON l.session_id = s.session_id
+             WHERE s.parent_session_id IS NOT NULL
+                 AND NOT EXISTS(SELECT 1 FROM session_titles t WHERE t.session_id = s.session_id)
+             ORDER BY l.depth",
+            )
+            .map_err(|source| query(&self.path, source))?;
+        let forks = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| query(&self.path, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| query(&self.path, source))?;
+        for (session, parent) in forks {
+            inherit_title(&self.connection, &self.path, &session, &parent)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn list_sessions(
         &self,
         workspace: &Path,
@@ -499,8 +660,16 @@ impl SessionStorage {
         let rows = statement
             .query_map([workspace.as_ref()], decode_session)
             .map_err(|source| query(&self.path, source))?;
-        rows.map(|row| row.map_err(|source| query(&self.path, source)))
-            .collect()
+        let titles = self.titles()?;
+        rows.map(|row| {
+            let mut session = row.map_err(|source| query(&self.path, source))?;
+            if let Some(title) = titles.get(&session.session_id) {
+                session.preview.clone_from(&title.text);
+                session.title_pending = title.pending;
+            }
+            Ok(session)
+        })
+        .collect()
     }
 
     pub(crate) fn find_sessions(
@@ -762,6 +931,26 @@ fn ensure_discovery_indexes(connection: &Connection, path: &Path) -> Result<(), 
         .map_err(|source| query(path, source))
 }
 
+fn ensure_titles(connection: &Connection, path: &Path) -> Result<(), StorageError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_titles(
+             session_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+             source TEXT NOT NULL CHECK(source IN ('generated', 'manual'))
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS title_claims(
+             session_id TEXT PRIMARY KEY, claimed_at_ms INTEGER NOT NULL
+         ) STRICT;",
+        )
+        .map_err(|source| query(path, source))
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
 fn database_version(connection: &Connection, path: &Path) -> Result<i32, StorageError> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -863,6 +1052,47 @@ fn upsert_session(
             ],
         )
         .map_err(|source| query(path, source))?;
+    if let Some(parent) = &started.parent_session_id {
+        inherit_title(transaction, path, &started.session_id, parent)?;
+    }
+    Ok(())
+}
+
+fn inherit_title(
+    connection: &Connection,
+    path: &Path,
+    session: &str,
+    parent: &str,
+) -> Result<(), StorageError> {
+    let inherited = connection
+        .query_row(
+            "SELECT t.title, (SELECT e.prompt_text FROM events e
+             WHERE e.session_id = s.session_id AND e.prompt_text IS NOT NULL
+             ORDER BY e.event_id LIMIT 1)
+         FROM sessions s LEFT JOIN session_titles t ON t.session_id = s.session_id
+         WHERE s.session_id = ?1",
+            [parent],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| query(path, source))?;
+    if let Some((title, prompt)) = inherited {
+        let title = title.unwrap_or_else(|| {
+            crate::core::titles::fallback(prompt.as_deref().unwrap_or_default())
+        });
+        connection
+            .execute(
+                "INSERT INTO session_titles(session_id, title, source) VALUES (?1, ?2, 'generated')
+             ON CONFLICT(session_id) DO NOTHING",
+                params![session, title],
+            )
+            .map_err(|source| query(path, source))?;
+    }
     Ok(())
 }
 
@@ -928,6 +1158,7 @@ fn decode_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> {
         reasoning_mode: decode_json_column(4, &reasoning_mode)?,
         workspace: PathBuf::from(row.get::<_, String>(5)?),
         preview: row.get(6)?,
+        title_pending: false,
     })
 }
 
@@ -1369,6 +1600,227 @@ mod tests {
             .find_sessions("current", None, Some(&[]), None, None, 10)
             .unwrap();
         assert!(none.sessions.is_empty());
+    }
+
+    #[test]
+    fn title_claims_are_idempotent_and_manual_renames_win_late_generation() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut first = SessionStorage::open(&config).unwrap();
+        append_prompt(&mut first, "session", 100, "original prompt");
+        let second = SessionStorage::open(&config).unwrap();
+        assert!(
+            first
+                .claim_title("session", "original prompt", true)
+                .unwrap()
+        );
+        assert!(
+            !second
+                .claim_title("session", "competing fallback", true)
+                .unwrap()
+        );
+        first.complete_title("session", "Generated title").unwrap();
+        assert_eq!(second.titles().unwrap()["session"].text, "Generated title");
+        second.rename_session("session", "My title").unwrap();
+        first
+            .complete_title("session", "Late generated title")
+            .unwrap();
+        assert!(
+            !first
+                .claim_title("session", "another attempt", true)
+                .unwrap()
+        );
+        let reopened = SessionStorage::open(&config).unwrap();
+        assert_eq!(reopened.titles().unwrap()["session"].text, "My title");
+        assert_eq!(
+            reopened.list_sessions(Path::new("/work"), false).unwrap()[0].preview,
+            "My title"
+        );
+        assert!(reopened.untitled_prompts(2).unwrap().is_empty());
+        assert_eq!(
+            super::database_version(&reopened.connection, &reopened.path).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn generation_claims_pend_until_they_reach_a_terminal_outcome() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut storage = SessionStorage::open(&config).unwrap();
+        for (index, session) in ["generated", "failed", "abandoned", "renamed", "offline"]
+            .into_iter()
+            .enumerate()
+        {
+            append_prompt(&mut storage, session, 100 + index as u64, "first prompt");
+            let generating = session != "offline";
+            assert!(
+                storage
+                    .claim_title(session, "first prompt", generating)
+                    .unwrap()
+            );
+        }
+        let pending = |storage: &SessionStorage| {
+            let mut pending = storage
+                .titles()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, title)| title.pending)
+                .map(|(session, _)| session)
+                .collect::<Vec<_>>();
+            pending.sort();
+            pending
+        };
+        assert_eq!(
+            pending(&storage),
+            ["abandoned", "failed", "generated", "renamed"]
+        );
+        let listed = storage.list_sessions(Path::new("/work"), false).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.session_id == "failed" && session.title_pending)
+        );
+
+        storage
+            .complete_title("generated", "Generated title")
+            .unwrap();
+        storage.settle_title("failed").unwrap();
+        storage
+            .connection
+            .execute(
+                "UPDATE title_claims SET claimed_at_ms = ?1 WHERE session_id = 'abandoned'",
+                [super::unix_ms() - super::GENERATION_LIMIT.as_millis() as i64],
+            )
+            .unwrap();
+        storage.rename_session("renamed", "My title").unwrap();
+
+        let reader = SessionStorage::open_read_only(&config).unwrap().unwrap();
+        assert!(pending(&reader).is_empty());
+        let titles = reader.titles().unwrap();
+        assert_eq!(titles["generated"].text, "Generated title");
+        assert_eq!(titles["failed"].text, "first prompt");
+        assert_eq!(titles["abandoned"].text, "first prompt");
+        assert_eq!(titles["renamed"].text, "My title");
+        assert!(
+            reader
+                .list_sessions(Path::new("/work"), false)
+                .unwrap()
+                .iter()
+                .all(|session| !session.title_pending)
+        );
+    }
+
+    #[test]
+    fn forks_inherit_a_snapshot_of_the_parent_title_without_generation() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut storage = SessionStorage::open(&config).unwrap();
+        append_prompt(&mut storage, "parent", 100, "parent prompt");
+        storage.rename_session("parent", "Parent title").unwrap();
+        append_fork(&mut storage, "fork", "parent");
+        storage
+            .rename_session("parent", "Later parent title")
+            .unwrap();
+        storage.inherit_titles().unwrap();
+        assert_eq!(storage.titles().unwrap()["fork"].text, "Parent title");
+        assert!(storage.untitled_prompts(2).unwrap().is_empty());
+        storage.rename_session("fork", "Fork title").unwrap();
+        storage.inherit_titles().unwrap();
+        assert_eq!(storage.titles().unwrap()["fork"].text, "Fork title");
+    }
+
+    #[test]
+    fn forks_bound_fallback_titles_and_backfill_legacy_lineages_in_parent_order() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut storage = SessionStorage::open(&config).unwrap();
+        append_prompt(
+            &mut storage,
+            "parent",
+            300,
+            &format!("\n First line\n{}", "long context ".repeat(100)),
+        );
+        append_fork(&mut storage, "fork", "parent");
+        assert_eq!(storage.titles().unwrap()["fork"].text, "First line");
+        append_prompt(&mut storage, "legacy_child", 200, "child's own prompt");
+        append_prompt(
+            &mut storage,
+            "legacy_grandchild",
+            100,
+            "grandchild's own prompt",
+        );
+        storage.connection.execute("UPDATE sessions SET parent_session_id = 'parent' WHERE session_id = 'legacy_child'", []).unwrap();
+        storage.connection.execute("UPDATE sessions SET parent_session_id = 'legacy_child' WHERE session_id = 'legacy_grandchild'", []).unwrap();
+        storage.inherit_titles().unwrap();
+        let titles = storage.titles().unwrap();
+        assert_eq!(titles["legacy_child"].text, "First line");
+        assert_eq!(titles["legacy_grandchild"].text, "First line");
+        let manual = "界".repeat(120);
+        storage.rename_session("parent", &manual).unwrap();
+        append_fork(&mut storage, "new_fork", "parent");
+        assert_eq!(storage.titles().unwrap()["new_fork"].text, manual);
+    }
+
+    fn append_fork(storage: &mut SessionStorage, session: &str, parent: &str) {
+        let fork = Arc::new(
+            TranscriptRecord::from_local(
+                1,
+                200,
+                LocalEvent::SessionStarted(SessionStarted {
+                    session_id: session.to_owned(),
+                    parent_session_id: Some(parent.to_owned()),
+                    parent_sequence: Some(2),
+                    model: "gpt-6-luna".to_owned(),
+                    effort: ReasoningEffort::Low,
+                    reasoning_mode: ReasoningMode::Standard,
+                    speed: Speed::Standard,
+                    workspace: "/work".into(),
+                    application_version: "test".to_owned(),
+                }),
+            )
+            .unwrap(),
+        );
+        storage.append_records(session, &[fork]).unwrap();
+    }
+
+    #[test]
+    fn title_backfill_is_bounded_and_uses_only_the_first_prompt() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut storage = SessionStorage::open(&config).unwrap();
+        append_prompt(&mut storage, "old", 100, "first prompt");
+        append_prompt_record(&mut storage, "old", 3, 150, "later prompt");
+        append_prompt(&mut storage, "new", 200, "new prompt");
+        assert_eq!(
+            storage.untitled_prompts(1).unwrap(),
+            [("new".to_owned(), "new prompt".to_owned())]
+        );
+        storage.claim_title("new", "new prompt", true).unwrap();
+        assert_eq!(
+            storage.untitled_prompts(2).unwrap(),
+            [("old".to_owned(), "first prompt".to_owned())]
+        );
+        storage
+            .connection
+            .execute("DROP TABLE session_titles", [])
+            .unwrap();
+        assert!(
+            SessionStorage::open_read_only(&config)
+                .unwrap()
+                .unwrap()
+                .titles()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            SessionStorage::open(&config)
+                .unwrap()
+                .titles()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     fn append_prompt(storage: &mut SessionStorage, session_id: &str, at: u64, text: &str) {
