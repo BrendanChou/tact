@@ -1,6 +1,6 @@
 //! Tact's supported model roster and input parsing.
 
-use crate::app::config::{ReasoningEffort, ReasoningMode, Speed};
+use crate::app::config::{ClaudeConfig, ReasoningEffort, ReasoningMode, Speed};
 use clap::ValueEnum;
 use nanocodex::{
     ClaudeModel, HarnessModel as Model, Model as CodexModel, ReasoningMode as NativeReasoningMode,
@@ -8,32 +8,13 @@ use nanocodex::{
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tact_subagents::{AgentContext, SUPPORTED_MODELS};
 
-/// The number of OpenAI models in [`SUPPORTED_MODELS`]. The roster lists every OpenAI model
-/// before any Claude model, so the OpenAI-only roster is a prefix of the full one; the
-/// assertion below rejects a roster that breaks this ordering at compile time.
-const OPENAI_MODEL_COUNT: usize = {
-    let mut count = 0;
-    while count < SUPPORTED_MODELS.len() && matches!(SUPPORTED_MODELS[count], Model::Codex(_)) {
-        count += 1;
-    }
-    let mut rest = count;
-    while rest < SUPPORTED_MODELS.len() {
-        assert!(
-            !matches!(SUPPORTED_MODELS[rest], Model::Codex(_)),
-            "OpenAI models must precede Claude models in SUPPORTED_MODELS"
-        );
-        rest += 1;
-    }
-    count
-};
-
-/// The selectable models: the full roster when Claude is enabled, otherwise only OpenAI models.
-pub(crate) fn available(claude_enabled: bool) -> &'static [Model] {
-    if claude_enabled {
-        &SUPPORTED_MODELS
-    } else {
-        &SUPPORTED_MODELS[..OPENAI_MODEL_COUNT]
-    }
+/// The models `claude` enables, in picker order: every OpenAI model, each Claude model when
+/// Claude is enabled, and access-gated Claude models only with a Glasswing key.
+pub(crate) fn available(claude: &ClaudeConfig) -> Vec<Model> {
+    SUPPORTED_MODELS
+        .into_iter()
+        .filter(|model| claude.ensure_model_enabled(*model).is_ok())
+        .collect()
 }
 
 pub(crate) fn parse(value: &str) -> Result<Model, String> {
@@ -71,9 +52,9 @@ pub(crate) enum Provider {
 }
 
 impl ModelCatalog {
-    pub(crate) fn new(claude_enabled: bool) -> Self {
+    pub(crate) fn new(models: &[Model]) -> Self {
         Self {
-            models: available(claude_enabled)
+            models: models
                 .iter()
                 .map(|&model| ModelOption::new(model))
                 .collect(),
@@ -127,20 +108,21 @@ pub(crate) const fn name(model: Model) -> &'static str {
         Model::Claude(ClaudeModel::Sonnet55) => "Sonnet 5.5",
         Model::Claude(ClaudeModel::Opus55) => "Opus 5.5",
         Model::Claude(ClaudeModel::Fable51) => "Fable 5.1",
+        Model::Claude(ClaudeModel::Mythos51) => "Mythos 5.1",
         _ => model.as_str(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelCatalog, Provider, parse};
-    use crate::app::config::{ReasoningMode, Speed};
+    use super::{ModelCatalog, Provider, available, parse};
+    use crate::app::config::{ClaudeConfig, ReasoningMode, Speed};
     use nanocodex::{ClaudeModel, HarnessModel as Model, Model as CodexModel};
     use tact_subagents::SUPPORTED_MODELS;
 
     #[test]
     fn catalog_lists_the_enabled_roster_with_its_setting_couplings() {
-        let openai_only = ModelCatalog::new(false);
+        let openai_only = ModelCatalog::new(&available(&claude("enabled = false")));
         assert!(
             openai_only
                 .models
@@ -154,7 +136,7 @@ mod tests {
                 .filter(|model| matches!(model, Model::Codex(_)))
                 .count()
         );
-        let catalog = ModelCatalog::new(true);
+        let catalog = ModelCatalog::new(&available(&claude("enabled = true")));
         assert_eq!(catalog.speeds, Speed::ALL);
         assert_eq!(catalog.efforts.len(), 5);
 
@@ -189,6 +171,39 @@ mod tests {
         assert!(sonnet.effort_fixed_after_start);
     }
 
+    fn claude(section: &str) -> ClaudeConfig {
+        toml::from_str(section).unwrap()
+    }
+
+    #[test]
+    fn gated_models_need_claude_and_a_glasswing_key() {
+        let mythos = Model::Claude(ClaudeModel::Mythos51);
+        let codex: Vec<Model> = SUPPORTED_MODELS
+            .into_iter()
+            .filter(|model| matches!(model, Model::Codex(_)))
+            .collect();
+        let without_mythos: Vec<Model> = SUPPORTED_MODELS
+            .into_iter()
+            .filter(|model| *model != mythos)
+            .collect();
+        let glasswing = "glasswing_api_key = 'sk-ant-api03-glasswing'";
+
+        assert_eq!(available(&claude("enabled = false")), codex);
+        assert_eq!(
+            available(&claude(&format!("enabled = false\n{glasswing}"))),
+            codex
+        );
+        assert_eq!(available(&claude("enabled = true")), without_mythos);
+        assert_eq!(
+            available(&claude("enabled = true\nglasswing_api_key = ''")),
+            without_mythos
+        );
+        assert_eq!(
+            available(&claude(&format!("enabled = true\n{glasswing}"))),
+            SUPPORTED_MODELS
+        );
+    }
+
     #[test]
     fn accepts_current_model_ids_and_short_names() {
         for (value, expected) in [
@@ -207,6 +222,8 @@ mod tests {
             ("claude-opus-5-5", Model::Claude(ClaudeModel::Opus55)),
             ("fable-5.1", Model::Claude(ClaudeModel::Fable51)),
             ("claude-fable-5-1", Model::Claude(ClaudeModel::Fable51)),
+            ("mythos-5.1", Model::Claude(ClaudeModel::Mythos51)),
+            ("claude-mythos-5-1", Model::Claude(ClaudeModel::Mythos51)),
         ] {
             assert_eq!(parse(value), Ok(expected));
         }
