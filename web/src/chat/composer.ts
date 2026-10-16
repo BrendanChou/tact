@@ -281,7 +281,7 @@ export class Composer {
     const id = session.id;
     return new DraftSync(session.draft, {
       origin: this.host.api.origin,
-      write: (text) => this.host.api.command("set_draft", { session: id, text }).then(() => {}),
+      write: (text) => this.host.api.command("set_draft", { session: id, text }),
       onRemote: (text, origin) => {
         const focused = document.activeElement === this.textarea;
         const atEnd = this.textarea.selectionStart === this.textarea.value.length;
@@ -461,7 +461,7 @@ export class Composer {
       await this.host.api.command("submit", { session: session.id, rev, queue });
       this.hideMessage();
     } catch (error) {
-      this.showMessage(describeError(error), "warning");
+      if (this.sync === sync) this.showMessage(describeError(error), "warning");
     } finally {
       this.submitting = false;
       this.updateSendState();

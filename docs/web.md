@@ -64,9 +64,20 @@ Static assets are public. Every `/api/*` route except `POST /api/login` requires
 | `GET /api/sessions/{id}/entries/{n}` | `ToolDetail` of one entry (full arguments, result, metadata, each string truncated at 256 KiB) |
 | `GET /api/sessions/{id}/agents/{agent}/entries` | `{ entries: WireEntry[] }`, the projected transcript of one subagent |
 | `GET /api/sessions/{id}/entries/{n}/images/{i}` | The i-th image attached to a user entry, decoded; only PNG, JPEG, GIF, and WebP are served |
-| `GET /api/file?path=&session=` | A local image that Markdown refers to (absolute, `file://`, or a path relative to the session's workspace, else the default workspace), as the terminal transcript shows such images. Only files whose bytes are PNG, JPEG, GIF, or WebP and at most 25 MiB are served; anything else is 404 |
+| `GET /api/file?path=&session=` | A local image that Markdown refers to (absolute, `file://`, or relative as "Local files" describes), as the terminal transcript shows such images. Only files whose bytes are PNG, JPEG, GIF, or WebP and at most 25 MiB are served. Anything else is 404 |
+| `GET /api/document?path=&session=` | `{ path, text }`, a local text file that Markdown links to, for the file viewer. `path` is the file's canonical absolute path. Refusals: `not_found` (404), `not_a_file` (422, directories and special files), `too_large` (413, over 2 MiB), `binary` (415, not UTF-8 or containing NUL), `unreadable` (403) |
 | `GET /api/sessions/{id}/agents/{agent}/entries/{n}` | `ToolDetail` of one subagent entry |
 | `GET /api/stream` | Server-Sent Events, below |
+
+### Local files
+
+Both file routes take a decoded filesystem path in the query value. A literal `file://` prefix
+is also accepted and stripped. Markdown file URLs are normalized by the client before the request.
+A relative path resolves against the workspace of `session`, or the default workspace when the
+session is not live. The viewer resolves its document's relative links and images against the
+returned canonical directory before requesting them. Files anywhere on this machine are served,
+as the token already grants that reach. Both routes check the opened file's type and
+size before reading it. Reads also stop at the size limit if a file grows during the read.
 
 ## Stream
 
@@ -76,6 +87,9 @@ One SSE stream per tab, following the shared active session. On connect it emits
 every 15 s. Entry events are coalesced to the TUI's frame interval. A tab that connects between
 two coalesced deliveries can receive an `entry` its snapshot already holds; the upsert rule makes
 that harmless.
+
+Draft text in snapshots and `draft` events is sent in full because clients use it to synchronize
+saved edits.
 
 | Event | Data |
 | :-- | :-- |
@@ -189,8 +203,10 @@ Clients must render unknown entry kinds as a muted generic row.
 
 `POST /api/cmd` with `X-Tact: 1` and the body `{ client, cmd: <name>, args: { ...body } }`
 (`client` is a random per-tab integer; commands without a body omit `args`). The body deserializes
-straight into `protocol::Command`; there is no per-command route. Success is 200 `{}`
-(`open_session` returns `{ session }`). The command is acknowledged only after the loop applied it.
+straight into `protocol::Command`. There is no per-command route. Success is 200 `{}`, except
+`open_session` returns `{ session }` and `set_draft` returns `{ rev }`. The command is acknowledged
+only after the loop applied it and published its changes. The draft receipt identifies the saved
+text even when no text changed or its stream echo was missed.
 `open_session` takes its variant as `args`, for example `{ cmd: "open_session", args: { new: {} } }`.
 
 | Command | Body | Keyboard equivalent | Refused |
@@ -468,6 +484,17 @@ mobile-first.
   **Running** for a command or cell and **Exploring** otherwise, and the row is open so the live
   call stays in sight. Toggling a row inverts that default, and the choice stays with the row as
   the run grows.
+- **File viewer.** A Markdown link to a local file (`[report](/Users/me/scratch/report.md)`,
+  `[guide](docs/guide.md#setup)`, or `[main](src/main.rs:42)`) opens the file in a new tab at
+  `./?file=<path>&session=<id>&line=<n>#<heading>` instead of a path on the server. Relative paths
+  are the session's workspace's. Percent-encoding is decoded, and a trailing `:line` or `:line:column`
+  is the line to show. Use `./README:12` for a bare filename without an extension.
+  Markdown files render as in the transcript, with a **Source** view of numbered
+  lines, and a fragment scrolls to the heading it names. Other text files show as numbered lines.
+  Source views use pages of 10,000 lines to keep large files responsive. A line link opens its page.
+  Links and images inside a viewed file resolve against its directory and open further viewer
+  tabs. Fragment-only links in any rendering scroll to the heading they name. A file that is missing,
+  not a regular file, larger than 2 MiB, binary, or unreadable shows why instead.
 - **Prompt minimap.** One tick per prompt on the chat's right edge; longer prompts draw longer
   ticks and the current one is highlighted. Pointing at it lists prompt previews, choosing one
   scrolls there, and sessions with more than 12 prompts page through them. Under the current
@@ -556,3 +583,5 @@ The token is equivalent to a shell as the user. Drafts are visible to every conn
 transcript and draft text is rendered as text or through the sanitizing Markdown renderer, math is
 typeset from the sanitized source, and Mermaid renders diagrams in its strict mode; agent MDX runs
 only in the opaque-origin sandboxed overview frame.
+The file viewer receives a file's text as JSON from an authenticated route and shows it through the
+same renderer or as plain text, so a viewed HTML or SVG file is never parsed as a page.

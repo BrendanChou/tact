@@ -181,6 +181,9 @@ export type SessionSnapshot = {
 
 export type ToolDetail = { arguments: unknown; result: unknown | null; metadata: unknown | null };
 
+/** A local text file for the viewer. `path` is canonical, so the file's own links resolve against it. */
+export type LocalDocument = { path: string; text: string };
+
 export type StreamEvents = {
   hello: { protocol_version: number; client_hint: string };
   live: { active: string | null; sessions: SessionSummary[] };
@@ -251,7 +254,9 @@ export type Commands = {
 export type CommandName = keyof Commands;
 
 export type CommandReplies = {
-  [Name in CommandName]: Name extends "open_session" ? { session: string } : Record<string, never>;
+  [Name in CommandName]: Name extends "open_session" ? { session: string }
+    : Name extends "set_draft" ? { rev: number }
+    : Record<string, never>;
 };
 
 export type ModelInfo = {
