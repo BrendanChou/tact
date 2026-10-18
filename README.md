@@ -5,7 +5,7 @@
 [![Crates.io MSRV](https://img.shields.io/crates/msrv/tact?style=for-the-badge)](https://crates.io/crates/tact)
 [![Crates.io Version](https://img.shields.io/crates/v/tact?style=for-the-badge)](https://crates.io/crates/tact)
 
-Tact is a coding agent for your terminal, built on [Nanocodex](https://github.com/gakonst/nanocodex).
+Tact is a coding agent for your terminal, built on [Nanocodex](https://github.com/gakonst/nanocode).
 It runs OpenAI's GPT-6 models out of the box and can also drive Anthropic's Claude models. Alongside
 the terminal UI, every Tact process serves a web interface you can open from a browser or your phone,
 with a built-in code review panel. Agents can delegate work to subagents, keep a small long-term
@@ -323,7 +323,7 @@ Esc to cancel.
 | Model | ID | Default effort |
 | --- | --- | --- |
 | `luna` | `gpt-6-luna` | medium |
-| `sol` | `gpt-6.1-sol` | low |
+| `sol` | `gpt-6.1-sol` | medium |
 | `astra` | `gpt-6-astra` | low |
 | `haiku-5.5` | `claude-haiku-5-5` | medium |
 | `sonnet-5.5` | `claude-sonnet-5-5` | high |
