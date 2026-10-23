@@ -139,11 +139,9 @@ impl Tool for SpawnAgent {
             .filter_map(|&model| crate::models::alias(model))
             .collect();
         let provider_policy = if roster.iter().any(|model| matches!(model, Model::Claude(_))) {
-            "Codex children cannot exceed a Codex parent's tier: luna < sol < astra. \
-             Cross-provider selection and delegation between Claude models are supported, subject to effort caps."
+            "Cross-provider selection and delegation between Claude models are supported, subject to effort caps."
         } else {
-            "Only Codex is enabled. Choose at or below the spawning parent's tier: luna < sol < astra, \
-             subject to effort caps."
+            "Only Codex is enabled. Choose a model for the assigned task, subject to effort caps."
         };
         let model_description = format!(
             "Name {} explicitly. Choose model and effort independently for expected quality, total cost, \
