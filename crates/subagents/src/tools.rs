@@ -206,7 +206,7 @@ impl Tool for SpawnAgent {
         let capacity = registry.reserve_turn()?;
         let reservation = registry.reserve(context.session_id()).await?;
         reservation
-            .validate_child(context.model(), model, thinking, reasoning_mode)
+            .validate_child(thinking, reasoning_mode)
             .map_err(SubagentError::from)?;
         let id = reservation.id;
         let (child, events, child_context) =
@@ -770,7 +770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_enforces_root_model_order_and_accepts_supported_efforts() {
+    async fn spawn_agent_accepts_supported_models_and_efforts() {
         let (updates, _receiver) = mpsc::unbounded_channel();
         let registry = Arc::new(Registry::new(updates, 1));
         let (captured, mut arguments) = mpsc::unbounded_channel();
@@ -807,45 +807,41 @@ mod tests {
             ("sol", Model::Codex(CodexModel::Sol)),
             ("astra", Model::Codex(CodexModel::Astra)),
         ];
-        for (parent_rank, (_, parent_model)) in models.iter().enumerate() {
-            for (child_rank, (model, expected_model)) in models.iter().copied().enumerate() {
-                for (thinking, expected) in [
-                    ("low", Thinking::Low),
-                    ("medium", Thinking::Medium),
-                    ("high", Thinking::High),
-                    ("xhigh", Thinking::Xhigh),
-                    ("max", Thinking::Max),
-                ] {
-                    let input = json!({
-                        "role": "reviewer",
-                        "task": "Review a focused change.",
-                        "model": model,
-                        "thinking": thinking,
-                        "output_schema": { "type": "object" }
-                    });
-                    assert!(validator.is_valid(&input));
-                    let error = tool
-                        .execute(
-                            ToolInput::Function(to_raw_value(&input).unwrap()),
-                            ToolContext::new(parent_model.as_str(), "root", "spawn", &[], 128),
-                        )
-                        .await
-                        .err()
-                        .expect("factory should stop after capture");
-                    if child_rank > parent_rank {
-                        assert!(matches!(
-                            subagent_error(&error),
-                            SubagentError::Spawn(SpawnError::ModelExceedsParent { .. })
-                        ));
-                        assert!(arguments.try_recv().is_err());
-                        continue;
-                    }
-                    assert!(matches!(subagent_error(&error), SubagentError::Agent(_)));
-                    assert_eq!(
-                        arguments.try_recv().unwrap(),
-                        (expected_model, expected, Speed::Standard)
-                    );
-                }
+        for (model, expected_model) in models {
+            for (thinking, expected) in [
+                ("low", Thinking::Low),
+                ("medium", Thinking::Medium),
+                ("high", Thinking::High),
+                ("xhigh", Thinking::Xhigh),
+                ("max", Thinking::Max),
+            ] {
+                let input = json!({
+                    "role": "reviewer",
+                    "task": "Review a focused change.",
+                    "model": model,
+                    "thinking": thinking,
+                    "output_schema": { "type": "object" }
+                });
+                assert!(validator.is_valid(&input));
+                let error = tool
+                    .execute(
+                        ToolInput::Function(to_raw_value(&input).unwrap()),
+                        ToolContext::new(
+                            Model::Codex(CodexModel::Sol).as_str(),
+                            "root",
+                            "spawn",
+                            &[],
+                            128,
+                        ),
+                    )
+                    .await
+                    .err()
+                    .expect("factory should stop after capture");
+                assert!(matches!(subagent_error(&error), SubagentError::Agent(_)));
+                assert_eq!(
+                    arguments.try_recv().unwrap(),
+                    (expected_model, expected, Speed::Standard)
+                );
             }
         }
 
